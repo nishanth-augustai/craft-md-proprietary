@@ -3,6 +3,8 @@ import time
 from openai import AzureOpenAI
 import openai
 
+from configurations import ModelAPIConfig
+
 client = AzureOpenAI(api_version="2023-05-15",
                      api_key = openai.api_key,
                      azure_endpoint=openai.api_base)
@@ -115,3 +117,67 @@ def call_gpt4v_api(convo, deployment_name, max_tokens=150, depth_limit=0):
                 return call_gpt4v_api(convo, max_tokens, depth_limit+1)
             else:
                 return None  
+            
+            
+##### Proprietary Models #####
+
+def call_proprietary_model(model_config: ModelAPIConfig, req_type: str, convo: list=[], speciality: str=None, case_desc: str=None, question: str=None, mcq_choices: list=[], max_retries=3):
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {model_config.key}"
+    }
+    
+    payload = {
+        "request_type": req_type,
+        "messages": convo,
+        "speciality": speciality,
+        "case_desc": case_desc,
+        "question": question,
+        "mcq_choices": mcq_choices
+    }
+    
+    retries = 0
+    while retries <= max_retries:
+        try:
+            response = requests.post(
+                model_config.endpoint,
+                headers=headers,
+                json=payload
+            )
+            
+            response.raise_for_status()  # Raise exception for HTTP errors
+            response_data = response.json()
+            
+            # Check if status is success
+            if "status" in response_data and response_data["status"] != "success":
+                if retries < max_retries:
+                    print(f"Status not success, retrying ({retries+1}/{max_retries})...")
+                    retries += 1
+                    time.sleep(2)  # Add a delay before retrying
+                    continue
+                else:
+                    print(f"Max retries reached. Last status: {response_data.get('status')}")
+                    return None
+            
+            # Extract the assistant's response content
+            if "response" in response_data:
+                return response_data["response"]
+            elif "choices" in response_data and len(response_data["choices"]) > 0:
+                return response_data["choices"][0]["message"]["content"]
+            elif "message" in response_data:
+                return response_data["message"]["content"]
+            else:
+                print(f"Unexpected response format: {response_data}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            if retries < max_retries:
+                print(f"Error calling proprietary model: {e}, retrying ({retries+1}/{max_retries})...")
+                retries += 1
+                time.sleep(2)  # Add a delay before retrying
+            else:
+                print(f"Max retries reached. Last error: {e}")
+                return 'Error'
+    
+    return None

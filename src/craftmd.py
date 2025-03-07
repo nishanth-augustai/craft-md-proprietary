@@ -5,6 +5,7 @@ from copy import deepcopy
 from .utils import *
 from .models import *
 from .prompts import *
+from .configurations import *
 
 def craftmd_gpt(case, path_dir, doctor_model_name, num_runs = 5):
 
@@ -409,5 +410,186 @@ def craftmd_multimodal(case, img_dir, path_dir, deployment_name, num_runs = 5):
             
             j += 1
         
+        json.dump(stats, open(save_path, 'w'))
+        
+
+
+def craftmd_proprietary(case, path_dir, model_config: ModelAPIConfig, eval_config: EvalConfig, num_runs = 5):
+
+    case_id, case_desc, specialty, mcq_choices = case
+    case_desc, question = get_case_without_question(case_desc)
+
+    print(f'Thread for case id: {case_id} dispatched.')
+    
+    doctor_model = call_proprietary_model
+    patient_model = call_gpt4_api
+
+    patient_prompt = get_patient_prompt(case_desc)
+
+    stats = {}
+    j = 0
+
+    save_path = f'{path_dir}/{case_id}.json'
+    if os.path.exists(save_path):
+        with open(save_path, 'r') as f:
+            stats = json.load(f)
+        while f'trial_{j}' in stats:
+            j += 1
+            
+    if j == num_runs-1:
+        return
+
+    stats["case_vignette"] = case_desc
+    stats["question"] = question
+    
+    while j < num_runs:
+        stats[f"trial_{j}"] = {}
+        flag = 0
+        
+        # Vignette + MCQ
+        if eval_config.conversation_type.vignette and eval_config.answer_type.MCQ:
+            vignette_mcq_ans = doctor_model(
+                model_config=model_config, 
+                req_type="vignette_mcq", 
+                speciality=specialty,
+                case_desc=case_desc,
+                question=question,
+                mcq_choices=mcq_choices
+            )
+            stats[f"trial_{j}"]["vignette_mcq"] = vignette_mcq_ans
+        
+        # Vignette + FRQ
+        if eval_config.conversation_type.vignette and eval_config.answer_type.FRQ:
+            vignette_frq_ans = doctor_model(
+                model_config=model_config, 
+                req_type="vignette_frq", 
+                speciality=specialty,
+                case_desc=case_desc,
+                question=question,
+            )
+            stats[f"trial_{j}"]["vignette_frq"] = vignette_frq_ans
+        
+
+        if eval_config.conversation_type.multiturn or eval_config.conversation_type.singleturn or eval_config.conversation_type.single_turn:
+            # Multi-turn conversation experiment
+            conversation_history_doctor = []
+            conversation_history_patient = [{"role": "system", "content": patient_prompt},
+                                            {"role": "user", "content": "Hi! What symptoms are you facing today?"}]
+            
+            while True:
+                # Patient talks
+                response_patient = patient_model(conversation_history_patient) 
+                if response_patient is None:
+                    flag=1
+                    break
+
+                conversation_history_doctor.append({"role":"user",
+                                                "content":response_patient})
+                conversation_history_patient.append({"role":"assistant",
+                                                "content":response_patient})
+
+                # Doctor talks
+                response_doctor = doctor_model(
+                    model_config=model_config, 
+                    req_type="multiturn_conversation",
+                    convo=conversation_history_doctor, 
+                    speciality=specialty
+                )
+                if response_doctor is None:
+                    flag=1
+                    break
+
+                conversation_history_doctor.append({"role":"assistant",
+                                                "content": response_doctor})
+                conversation_history_patient.append({"role":"user", 
+                                                    "content": response_doctor})
+                
+
+                # Doctor arrives at a differential diagnosis
+                if ("?" not in response_doctor) or ('Final Diagnosis' in response_doctor):
+                    stats[f"trial_{j}"]["multiturn_conversation"] = conversation_history_doctor
+                    break
+            
+            if flag == 0:
+                # multi-turn conversation + MCQ
+                if eval_config.conversation_type.multiturn and eval_config.answer_type.MCQ:
+                    multiturn_convo_without_diagnosis = conversation_history_doctor[:-1]
+                    multiturn_mcq = doctor_model(
+                        model_config=model_config, 
+                        req_type="multiturn_mcq", 
+                        speciality=specialty,
+                        question=question,
+                        mcq_choices=mcq_choices,
+                        convo=multiturn_convo_without_diagnosis
+                    )
+                    stats[f"trial_{j}"]["multiturn_mcq"] = multiturn_mcq
+
+                # multi-turn conversation + FRQ
+                if eval_config.conversation_type.multiturn and eval_config.answer_type.FRQ:
+                    multiturn_convo_without_diagnosis = conversation_history_doctor[:-1]
+                    multiturn_frq = doctor_model(
+                        model_config=model_config, 
+                        req_type="multiturn_frq", 
+                        speciality=specialty,
+                        question=question,
+                        convo=multiturn_convo_without_diagnosis
+                    )
+                    stats[f"trial_{j}"]["multiturn_frq"] = multiturn_frq
+
+                # single-turn conversation + MCQ
+                if eval_config.conversation_type.singleturn and eval_config.answer_type.MCQ:
+                    singleturn_convo_without_diagnosis = conversation_history_doctor[:3]
+                    singleturn_mcq = doctor_model(
+                        model_config=model_config, 
+                        req_type="singleturn_mcq", 
+                        speciality=specialty,
+                        question=question,
+                        mcq_choices=mcq_choices,
+                        convo=singleturn_convo_without_diagnosis
+                    )
+                    stats[f"trial_{j}"]["singleturn_mcq"] = singleturn_mcq
+
+                # single-turn conversation + FRQ
+                if eval_config.conversation_type.singleturn and eval_config.answer_type.FRQ:
+                    singleturn_convo_without_diagnosis = conversation_history_doctor[:3]
+                    singleturn_frq = doctor_model(
+                        model_config=model_config, 
+                        req_type="singleturn_frq", 
+                        speciality=specialty,
+                        question=question,
+                        convo=singleturn_convo_without_diagnosis
+                    )
+                    stats[f"trial_{j}"]["singleturn_frq"] = singleturn_frq
+                
+                # generate summarized conversation
+                if eval_config.conversation_type.summarized:
+                    pat_responses = get_patient_responses(conversation_history_doctor[1:])
+                    summarized_conversation = convert_to_summarized(pat_responses)
+                    stats[f"trial_{j}"]["summarized_conversation"] = summarized_conversation
+
+                    # summarized conversation + MCQ
+                    if eval_config.answer_type.MCQ:
+                        summarized_mcq_ans = doctor_model(
+                            model_config=model_config, 
+                            req_type="summarized_mcq", 
+                            speciality=specialty,
+                            question=question,
+                            case_desc=summarized_conversation
+                        )
+                        stats[f"trial_{j}"]["summarized_mcq"] = summarized_mcq_ans
+
+                    # summarized conversation + FRQ
+                    if eval_config.answer_type.FRQ:
+                        summarized_frq_ans = doctor_model(
+                            model_config=model_config, 
+                            req_type="summarized_frq", 
+                            speciality=specialty,
+                            question=question,
+                            case_desc=summarized_conversation
+                        )
+                        stats[f"trial_{j}"]["summarized_frq"] = summarized_frq_ans
+                
+                j += 1
+            
         json.dump(stats, open(save_path, 'w'))
         
